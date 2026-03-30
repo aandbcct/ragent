@@ -66,20 +66,21 @@ import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.DEFAULT_TOP_K;
 @RequiredArgsConstructor
 public class RAGChatServiceImpl implements RAGChatService {
 
-    private final LLMService llmService;
-    private final RAGPromptService promptBuilder;
-    private final PromptTemplateLoader promptTemplateLoader;
-    private final ConversationMemoryService memoryService;
+    private final LLMService llmService; // 负责调用大模型并流式返回结果
+    private final RAGPromptService promptBuilder; // 负责拼装结构化 Prompt 消息
+    private final PromptTemplateLoader promptTemplateLoader; // 负责加载系统提示词模板
+    private final ConversationMemoryService memoryService; // 负责多轮会话记忆读写
     private final StreamTaskManager taskManager;
-    private final IntentGuidanceService guidanceService;
-    private final StreamCallbackFactory callbackFactory;
-    private final QueryRewriteService queryRewriteService;
-    private final IntentResolver intentResolver;
-    private final RetrievalEngine retrievalEngine;
+    private final IntentGuidanceService guidanceService; // 负责歧义检测与澄清引导
+    private final StreamCallbackFactory callbackFactory; // 负责创建 SSE 回调处理器
+    private final QueryRewriteService queryRewriteService; // 负责问题改写与多问拆分
+    private final IntentResolver intentResolver; // 负责子问题意图识别与聚合
+    private final RetrievalEngine retrievalEngine; // 负责 MCP/知识库检索
 
     @Override
     @ChatRateLimit
     public void streamChat(String question, String conversationId, Boolean deepThinking, SseEmitter emitter) {
+        // 1) 统一会话 ID 与任务 ID：外部未传时自动生成，便于链路追踪和中断任务
         String actualConversationId = StrUtil.isBlank(conversationId) ? IdUtil.getSnowflakeNextIdStr() : conversationId;
         String taskId = StrUtil.isBlank(RagTraceContext.getTaskId())
                 ? IdUtil.getSnowflakeNextIdStr()
@@ -87,14 +88,18 @@ public class RAGChatServiceImpl implements RAGChatService {
         log.info("开始流式对话，会话ID：{}，任务ID：{}", actualConversationId, taskId);
         boolean thinkingEnabled = Boolean.TRUE.equals(deepThinking);
 
+        // 2) 创建流式回调：统一向前端推送 token、完成和异常事件
         StreamCallback callback = callbackFactory.createChatEventHandler(emitter, actualConversationId, taskId);
 
+        // 3) 读取并追加会话记忆：将当前问题作为最新 user 消息写入上下文
         String userId = UserContext.getUserId();
         List<ChatMessage> history = memoryService.loadAndAppend(actualConversationId, userId, ChatMessage.user(question));
 
+        // 4) 改写 + 拆分问题，并做子问题意图识别，为后续检索与 Prompt 规划提供输入
         RewriteResult rewriteResult = queryRewriteService.rewriteWithSplit(question, history);
         List<SubQuestionIntent> subIntents = intentResolver.resolve(rewriteResult);
 
+        // 5) 歧义引导分支：若存在冲突意图，优先追问澄清后再继续
         GuidanceDecision guidanceDecision = guidanceService.detectAmbiguity(rewriteResult.rewrittenQuestion(), subIntents);
         if (guidanceDecision.isPrompt()) {
             callback.onContent(guidanceDecision.getPrompt());
@@ -102,9 +107,11 @@ public class RAGChatServiceImpl implements RAGChatService {
             return;
         }
 
+        // 6) system-only 快路径：若全部为系统能力，跳过检索直接回答
         boolean allSystemOnly = subIntents.stream()
                 .allMatch(si -> intentResolver.isSystemOnly(si.nodeScores()));
         if (allSystemOnly) {
+            // 优先使用意图节点自带模板，缺失时在下游方法回退到默认系统模板
             String customPrompt = subIntents.stream()
                     .flatMap(si -> si.nodeScores().stream())
                     .map(ns -> ns.getNode().getPromptTemplate())
@@ -112,11 +119,14 @@ public class RAGChatServiceImpl implements RAGChatService {
                     .findFirst()
                     .orElse(null);
             StreamCancellationHandle handle = streamSystemResponse(rewriteResult.rewrittenQuestion(), history, customPrompt, callback);
+            // 绑定任务句柄，支持 stopTask 主动中断
             taskManager.bindHandle(taskId, handle);
             return;
         }
 
+        // 7) 常规 RAG 路径：检索 MCP 与知识库上下文
         RetrievalContext ctx = retrievalEngine.retrieve(subIntents, DEFAULT_TOP_K);
+        // 8) 检索为空兜底：直接反馈未命中文档，避免无依据生成
         if (ctx.isEmpty()) {
             String emptyReply = "未检索到与问题相关的文档内容。";
             callback.onContent(emptyReply);
@@ -124,9 +134,10 @@ public class RAGChatServiceImpl implements RAGChatService {
             return;
         }
 
-        // 聚合所有意图用于 prompt 规划
+        // 9) 聚合多子问题意图，形成统一的 Prompt 规划输入
         IntentGroup mergedGroup = intentResolver.mergeIntentGroup(subIntents);
 
+        // 10) 构造请求并发起流式生成，最后绑定取消句柄
         StreamCancellationHandle handle = streamLLMResponse(
                 rewriteResult,
                 ctx,
@@ -140,6 +151,7 @@ public class RAGChatServiceImpl implements RAGChatService {
 
     @Override
     public void stopTask(String taskId) {
+        // 通过任务管理器中断正在进行的流式任务
         taskManager.cancel(taskId);
     }
 
@@ -147,10 +159,12 @@ public class RAGChatServiceImpl implements RAGChatService {
 
     private StreamCancellationHandle streamSystemResponse(String question, List<ChatMessage> history,
                                                           String customPrompt, StreamCallback callback) {
+        // system-only 场景：优先使用自定义模板，否则加载默认系统模板
         String systemPrompt = StrUtil.isNotBlank(customPrompt)
                 ? customPrompt
                 : promptTemplateLoader.load(CHAT_SYSTEM_PROMPT_PATH);
 
+        // 消息顺序：system + 历史(不含当前问题) + 当前 user 问题
         List<ChatMessage> messages = new ArrayList<>();
         messages.add(ChatMessage.system(systemPrompt));
         if (CollUtil.isNotEmpty(history)) {
@@ -158,6 +172,7 @@ public class RAGChatServiceImpl implements RAGChatService {
         }
         messages.add(ChatMessage.user(question));
 
+        // system-only 默认关闭深度思考，温度适中保证表达自然
         ChatRequest req = ChatRequest.builder()
                 .messages(messages)
                 .temperature(0.7D)
@@ -169,6 +184,7 @@ public class RAGChatServiceImpl implements RAGChatService {
     private StreamCancellationHandle streamLLMResponse(RewriteResult rewriteResult, RetrievalContext ctx,
                                                        IntentGroup intentGroup, List<ChatMessage> history,
                                                        boolean deepThinking, StreamCallback callback) {
+        // 整合改写问题、检索片段和意图分组，形成 Prompt 上下文
         PromptContext promptContext = PromptContext.builder()
                 .question(rewriteResult.rewrittenQuestion())
                 .mcpContext(ctx.getMcpContext())
@@ -178,12 +194,14 @@ public class RAGChatServiceImpl implements RAGChatService {
                 .intentChunks(ctx.getIntentChunks())
                 .build();
 
+        // 由 Prompt 服务生成结构化消息（主问题 + 子问题 + 历史）
         List<ChatMessage> messages = promptBuilder.buildStructuredMessages(
                 promptContext,
                 history,
                 rewriteResult.rewrittenQuestion(),
                 rewriteResult.subQuestions()  // 传入子问题列表
         );
+        // MCP 场景适当放宽采样参数；纯 KB 场景更偏确定性输出
         ChatRequest chatRequest = ChatRequest.builder()
                 .messages(messages)
                 .thinking(deepThinking)
